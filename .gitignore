@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+out/
+work/
+*.mp4
+*.mov
+*.wav
+taste.json
+.venv/
+*.plan.json
+*.check.json
