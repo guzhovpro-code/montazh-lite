@@ -264,14 +264,55 @@ def video_filter_graph(segs: list[dict], geo: dict) -> str:
     return ";".join(parts)
 
 
-def loudnorm_two_pass(wav_in: str, wav_out: str, lufs: float, tp: float, cwd: str) -> dict:
-    base = f"loudnorm=I={lufs}:TP={tp}:LRA=11"
+def loudnorm_measure(wav_in: str, base: str, cwd: str) -> dict:
     r = run([FFMPEG, "-hide_banner", "-nostats", "-i", wav_in, "-af", base + ":print_format=json",
              "-f", "null", "-"], cwd=cwd)
-    m = re.search(r"\{[^{}]*\"input_i\"[^{}]*\}", r.stderr, re.S)
+    # ffmpeg prints the measurements as one object right after the "[Parsed_loudnorm_N @ address]" line
+    m = re.search(r"^\[Parsed_loudnorm_\d+ @ [0-9A-Za-z]+\][ \t]*\r?\n(\{[^{}]*\})", r.stderr, re.M)
     if not m:
         die("loudnorm pass 1 failed: " + r.stderr[-400:])
-    st = json.loads(m.group(0))
+    try:
+        st = json.loads(m.group(1))
+    except ValueError:
+        die("loudnorm pass 1 returned unreadable measurements: " + m.group(1)[:200])
+    if not isinstance(st, dict):
+        die("loudnorm pass 1 returned unreadable measurements: " + m.group(1)[:200])
+    for key in ("input_i", "input_tp", "input_lra", "input_thresh", "target_offset"):
+        v = st.get(key)
+        try:
+            # ffmpeg quotes the numbers ("-23.93"); a string must be a plain decimal because it goes into the filter text
+            if isinstance(v, str):
+                ok = re.fullmatch(r"-?\d{1,6}(\.\d{1,6})?", v) is not None
+            else:
+                ok = isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(float(v))
+        except (ValueError, OverflowError):
+            ok = False
+        if not ok:
+            die(f"loudness measurement '{key}' is not a finite number (got {v!r}): "
+                "the sound is silent or too quiet to normalize. Check that the file has speech.")
+    if float(st["input_i"]) < -50:  # checked on every measurement, also the one after the pre-limit
+        die(f"the sound is too quiet to normalize ({st['input_i']} LUFS, limit -50). "
+            "Record again closer to the microphone or raise the recording level.")
+    return st
+
+
+def loudnorm_two_pass(wav_in: str, wav_out: str, lufs: float, tp: float, cwd: str) -> dict:
+    base = f"loudnorm=I={lufs}:TP={tp}:LRA=11"
+    st = loudnorm_measure(wav_in, base, cwd)
+    # Quiet input: the linear gain that reaches the target would push the peak over the ceiling, and
+    # loudnorm then falls back to its dynamic mode and misses the target. Lift the level first with a
+    # peak limiter, then measure again, so that the final pass is linear.
+    need = lufs - float(st["input_i"])
+    if 0 < need < 40 and float(st["input_tp"]) + need > tp:
+        lifted = os.path.join(cwd, "lifted.wav")
+        limit = 10 ** ((tp - 0.5) / 20)
+        r = run([FFMPEG, "-y", "-hide_banner", "-nostats", "-i", wav_in, "-af",
+                 f"volume={need:.2f}dB,alimiter=limit={limit:.4f}:attack=5:release=60:level=disabled",
+                 "-c:a", "pcm_s16le", lifted], cwd=cwd)
+        if r.returncode != 0:
+            die("loudness pre-limit failed: " + r.stderr[-400:])
+        wav_in = lifted
+        st = loudnorm_measure(wav_in, base, cwd)
     af = (base + f":measured_I={st['input_i']}:measured_TP={st['input_tp']}:measured_LRA={st['input_lra']}"
           f":measured_thresh={st['input_thresh']}:offset={st['target_offset']}:linear=true")
     r = run([FFMPEG, "-y", "-hide_banner", "-nostats", "-i", wav_in, "-af", af + ",aresample=48000",
@@ -357,11 +398,21 @@ def parse_face(s: str | None):
         die("--face-box must be four fractions: left,top,right,bottom (for example 0.35,0.12,0.65,0.55)")
 
 
+def is_junction(path: str) -> bool:
+    """Windows junction (mount point). os.path.isjunction exists only from Python 3.12, so older ones read the tag."""
+    if hasattr(os.path, "isjunction"):
+        return os.path.isjunction(path)
+    try:
+        return getattr(os.lstat(path), "st_reparse_tag", 0) == 0xA0000003  # IO_REPARSE_TAG_MOUNT_POINT
+    except OSError:
+        return False
+
+
 def linked_dir(path: str) -> str | None:
     """First parent folder of path that is a symbolic link (or a Windows junction), else None."""
     d = os.path.dirname(os.path.abspath(path))
     while True:
-        if os.path.islink(d) or (hasattr(os.path, "isjunction") and os.path.isjunction(d)):
+        if os.path.islink(d) or is_junction(d):
             return d
         parent = os.path.dirname(d)
         if parent == d:

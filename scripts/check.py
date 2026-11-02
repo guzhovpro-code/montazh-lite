@@ -36,10 +36,20 @@ FFMPEG = shutil.which("ffmpeg") or "ffmpeg"
 FFPROBE = shutil.which("ffprobe") or "ffprobe"
 
 
+def is_junction(path):
+    """Windows junction (mount point). os.path.isjunction exists only from Python 3.12, so older ones read the tag."""
+    if hasattr(os.path, "isjunction"):
+        return os.path.isjunction(path)
+    try:
+        return getattr(os.lstat(path), "st_reparse_tag", 0) == 0xA0000003  # IO_REPARSE_TAG_MOUNT_POINT
+    except OSError:
+        return False
+
+
 def linked_dir(path):
     d = os.path.dirname(os.path.abspath(path))
     while True:
-        if os.path.islink(d) or (hasattr(os.path, "isjunction") and os.path.isjunction(d)):
+        if os.path.islink(d) or is_junction(d):
             return d
         parent = os.path.dirname(d)
         if parent == d:
@@ -158,6 +168,9 @@ def main():
     if not Path(plan_path).exists():
         print("ERROR: no plan file " + plan_path, file=sys.stderr)
         return 2
+    if os.path.islink(plan_path):
+        print("ERROR: " + plan_path + " is a symbolic link; refusing to read the plan through it", file=sys.stderr)
+        return 2
     plan = json.load(open(plan_path, encoding="utf-8"))
     rows, ok_all = [], True
 
@@ -166,6 +179,8 @@ def main():
         ok_all &= ok
         rows.append({"check": name, "ok": ok, "status": status or ("PASS" if ok else "FAIL"), "detail": detail})
 
+    # montazh.py aims the peak at -2 dBTP before AAC; AAC adds up to ~0.3 dB. The check ceiling -1.0 is the
+    # limit for the delivered file and leaves a margin of 1 dB over the target, so it is not a second target.
     lufs, tp = loudness(video)
     if lufs is None:
         add("loudness", False, "could not measure")
