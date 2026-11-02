@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """montazh-lite: cleans a talking-head video with ffmpeg + Python standard library only.
 
-Three things, all local and free:
+Four things, all local and free:
   1. pauses: finds pauses in the speech by sound energy and cuts them down;
   2. sound: rumble filter, light denoise, loudness (default -16 LUFS);
-  3. zoom on the cuts: every second piece is punched in a little, so jump cuts look intentional.
+  3. zoom on the cuts: every second piece is punched in a little, so jump cuts look intentional;
+  4. colour: a light preset (natural, warm, cool, film, none) or your own .cube LUT.
 The result is a clean video, ready for effects, subtitles and animation (a different skill does those).
 
 Usage:
@@ -12,6 +13,7 @@ Usage:
   python montazh.py frame INPUT.mp4 --out frame.jpg [--at 0.5]
   python montazh.py run INPUT.mp4 --out OUT.mp4 [--face-box X0,Y0,X1,Y1] [--start S --end E] [--zoom 1.12]
                     [--min-pause 0.45] [--keep-gap 0.20] [--lufs -16] [--tp -2]
+                    [--grade natural|warm|cool|film|none|FILE.cube]
                     [--denoise off|light|strong] [--force] [--allow-linked-folders]
 Writes OUT.mp4 and OUT.plan.json (read by check.py).
 
@@ -30,6 +32,7 @@ import subprocess
 import sys
 import tempfile
 from array import array
+from collections import Counter
 from operator import mul
 from pathlib import Path
 
@@ -42,6 +45,15 @@ except Exception:
 # full paths: the same program is used for every call (and a fake one can stand in during tests)
 FFMPEG = shutil.which("ffmpeg") or "ffmpeg"
 FFPROBE = shutil.which("ffprobe") or "ffprobe"
+
+GRADES = {
+    "natural": "eq=contrast=1.05:saturation=1.08:gamma=0.98",
+    "warm": "colorbalance=rs=0.03:gs=0.0:bs=-0.04:rm=0.02:bm=-0.03,eq=contrast=1.04:saturation=1.10",
+    "cool": "colorbalance=rs=-0.03:bs=0.04:rm=-0.02:bm=0.03,eq=contrast=1.04:saturation=1.05",
+    "film": "curves=all='0/0.04 0.5/0.5 1/0.95',eq=saturation=0.92:contrast=1.02",
+    "none": "",
+}
+MAX_CUBE_BYTES = 40 * 1024 * 1024
 
 INSTALL_HELP = ("Install the full ffmpeg build (Windows: winget install Gyan.FFmpeg; Mac: brew install ffmpeg), "
                 "then restart the terminal.")
@@ -250,7 +262,71 @@ def audio_filter_graph(segs: list[dict], fps: float, denoise: str) -> str:
     return ";".join(parts)
 
 
-def video_filter_graph(segs: list[dict], geo: dict) -> str:
+def resolve_grade(name: str, work: str) -> str:
+    """Filter text for --grade. A .cube file is copied into the work folder so that its path never enters
+    the filter text (no escaping problems, no way to smuggle filter options through a file name)."""
+    if not isinstance(name, str):
+        die("--grade must be text: natural, warm, cool, film, none, or a .cube file")
+    if name in GRADES:
+        return GRADES[name]
+    if not name.lower().endswith(".cube"):
+        die("unknown --grade: " + name + " (natural, warm, cool, film, none, or a .cube file)")
+    try:
+        cube = Path(name).resolve()
+        if not cube.is_file():
+            die("LUT not found: " + str(cube))
+        if cube.stat().st_size > MAX_CUBE_BYTES:
+            die("LUT file is larger than 40 MB: " + str(cube))
+        head = cube.read_bytes()[:4096].decode("utf-8", "replace")
+    except (OSError, RuntimeError, ValueError) as e:  # unreadable file, link loop, odd characters in the name
+        die(f"cannot read the LUT file {name}: {e}")
+    m = re.search(r"^\s*LUT_3D_SIZE\s+(\d{1,4})\s*$", head, re.M)
+    if not m:
+        die("this is not a 3D .cube LUT (no LUT_3D_SIZE line near the top): " + str(cube))
+    if not 2 <= int(m.group(1)) <= 129:  # ffmpeg allocates size^3 entries before it reads the table
+        die(f"LUT_3D_SIZE {m.group(1)} is outside 2..129: " + str(cube))
+    try:
+        shutil.copy(cube, os.path.join(work, "grade.cube"))
+    except OSError as e:
+        die(f"cannot copy the LUT file {name}: {e}")
+    return "lut3d=file=grade.cube"
+
+
+def gray_summary(cmd: list[str], cwd: str | None = None) -> dict | None:
+    """Reads raw gray frames from ffmpeg in chunks (the video is never held in memory) and returns the average
+    brightness (0..255) and the shares of blown-out (>=250) and crushed-black (<=5) pixels."""
+    hist = [0] * 256
+    proc = subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    try:
+        while True:
+            chunk = proc.stdout.read(1 << 20)
+            if not chunk:
+                break
+            for value, count in Counter(chunk).items():
+                hist[value] += count
+    finally:
+        proc.stdout.close()
+        code = proc.wait()
+    n = sum(hist)
+    if not n or code != 0:  # a failed ffmpeg run may have delivered only part of the frames
+        return None
+    return {"mean": sum(v * c for v, c in enumerate(hist)) / n,
+            "blown": sum(hist[250:]) / n,
+            "crushed": sum(hist[:6]) / n}
+
+
+def picture_stats(src: str, start: float, length: float, segs: list[dict], geo: dict, work: str) -> dict | None:
+    """Average brightness (0..255) and the shares of blown-out (>=250) and crushed-black (<=5) pixels of the
+    cut and zoomed picture WITHOUT the colour, from 2 frames per second at 160x90. check.py measures the
+    finished file the same way, so both numbers cover the same frames in the same order."""
+    graph = video_filter_graph(segs, geo, "") + ";[vout]fps=2,scale=160:90:flags=area,format=gray[g]"
+    (Path(work) / "v0.txt").write_text(graph, encoding="utf-8")
+    cmd = [FFMPEG, "-v", "error", "-ss", f"{start:.3f}", "-t", f"{length:.3f}", "-i", src,
+           "-filter_complex_script", "v0.txt", "-map", "[g]", "-an", "-f", "rawvideo", "-"]
+    return gray_summary(cmd, work)
+
+
+def video_filter_graph(segs: list[dict], geo: dict, grade: str = "") -> str:
     n = len(segs)
     ow, oh = geo["out_w"], geo["out_h"]
     parts = [f"[0:v:0]split={n}" + "".join(f"[v{i}]" for i in range(n))]
@@ -260,7 +336,7 @@ def video_filter_graph(segs: list[dict], geo: dict) -> str:
                      f"crop={cw}:{ch}:{x0}:{y0},scale={ow}:{oh}:flags=lanczos,setsar=1[c{i}]")
     tail = "".join(f"[c{i}]" for i in range(n)) + f"concat=n={n}:v=1:a=0[cat]"
     parts.append(tail)
-    parts.append("[cat]format=yuv420p[vout]")
+    parts.append("[cat]" + (grade + "," if grade else "") + "format=yuv420p[vout]")
     return ";".join(parts)
 
 
@@ -345,7 +421,8 @@ def needed_filters() -> list[str]:
     names = set(EXTRA_FILTERS)
     for denoise in ("light", "strong"):
         names |= graph_filter_names(audio_filter_graph(segs, 50.0, denoise))
-    names |= graph_filter_names(video_filter_graph(segs, geo))
+    for grade in list(GRADES.values()) + ["lut3d=file=grade.cube"]:
+        names |= graph_filter_names(video_filter_graph(segs, geo, grade))
     return sorted(names)
 
 
@@ -494,8 +571,9 @@ def do_run(a: argparse.Namespace) -> int:
         print("[3/6] loudness")
         st = loudnorm_two_pass("cut.wav", "norm.wav", a.lufs, a.tp, work)
         # ---- picture
-        print("[4/6] picture: cuts and zoom")
-        vgraph = video_filter_graph(segs, geo)
+        print("[4/6] picture: cuts, zoom, colour")
+        vgraph = video_filter_graph(segs, geo, resolve_grade(a.grade, work))
+        before = picture_stats(src, t0, dur, segs, geo, work)  # the same picture without the colour, for the check
         (Path(work) / "v.txt").write_text(vgraph, encoding="utf-8")
         tmp_out = os.path.join(work, "out.mp4")
         cmd = [FFMPEG, "-y", "-hide_banner", "-nostats", "-v", "error", "-ss", f"{t0:.3f}", "-t", f"{dur:.3f}",
@@ -514,7 +592,9 @@ def do_run(a: argparse.Namespace) -> int:
 
     plan = {"input": Path(src).name, "start": t0, "end": t1, "fps": fps, "threshold_db": thr,
             "p5_db": p5_db(energy), "min_pause": a.min_pause, "keep_gap": a.keep_gap, "geo": geo, "zoom": a.zoom,
-            "face_box": face, "lufs": a.lufs, "tp": a.tp, "denoise": a.denoise,
+            "face_box": face, "grade": Path(a.grade).name if a.grade.lower().endswith(".cube") else a.grade,
+            "picture_before": before,
+            "lufs": a.lufs, "tp": a.tp, "denoise": a.denoise,
             "loudnorm_pass1": st, "segments": segs, "out_duration": out_dur}
     refuse_link(out + ".plan.json", a.allow_linked_folders)
     Path(out + ".plan.json").write_text(json.dumps(plan, ensure_ascii=False, indent=1), encoding="utf-8")
@@ -552,7 +632,7 @@ def do_frame(a: argparse.Namespace) -> int:
 
 
 def apply_taste(a: argparse.Namespace, sub: argparse.ArgumentParser) -> None:
-    """taste.json holds your habits (min_pause, keep_gap, zoom, lufs, tp, denoise).
+    """taste.json holds your habits (min_pause, keep_gap, zoom, grade, lufs, tp, denoise).
     A flag typed on the command line wins over the file; the file wins over built-in defaults."""
     path = Path(a.taste) if a.taste else Path("taste.json")
     if not path.exists():
@@ -563,7 +643,7 @@ def apply_taste(a: argparse.Namespace, sub: argparse.ArgumentParser) -> None:
         die(f"{path} is not valid JSON: {e}")
     used = []
     for key, val in taste.items():
-        known = ("min_pause", "keep_gap", "zoom", "lufs", "tp", "denoise")
+        known = ("min_pause", "keep_gap", "zoom", "grade", "lufs", "tp", "denoise")
         if key in known and getattr(a, key) == sub.get_default(key):
             setattr(a, key, val)
             used.append(key)
@@ -592,6 +672,7 @@ def main() -> int:
     r.add_argument("--keep-gap", type=float, default=0.20, help="breath left in a cut pause (s)")
     r.add_argument("--lufs", type=float, default=-16.0)
     r.add_argument("--tp", type=float, default=-2.0, help="true-peak ceiling before AAC (AAC adds up to ~0.3 dB)")
+    r.add_argument("--grade", default=None, help="natural (default), warm, cool, film, none, or a .cube LUT file")
     r.add_argument("--denoise", choices=["off", "light", "strong"], default="light")
     r.add_argument("--force", action="store_true", help="overwrite an existing result file")
     r.add_argument("--allow-linked-folders", action="store_true", help="allow writing inside a linked folder")
@@ -599,6 +680,8 @@ def main() -> int:
     a = ap.parse_args()
     if a.cmd == "run":
         apply_taste(a, r)
+        if a.grade is None:  # not given on the command line and not in taste.json
+            a.grade = "natural"
     if a.cmd == "doctor":
         return do_doctor()
     if a.cmd == "frame":

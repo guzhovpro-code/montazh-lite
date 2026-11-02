@@ -11,6 +11,8 @@ Checks:
   seams         no repeated frame and no empty (black or flat) frame at any cut
   duration      picture and sound have the same length (difference < 1 frame)
   zoom          the face box you gave stays fully inside every zoomed piece (zoom did not cut the face off)
+  grade         exposure sanity of the colour: (brightness after + 8) / (brightness before + 8) within 0.7-1.4, no more than
+                +10 points of crushed black and +5 points of blown-out pixels (brightness only, hue is judged by eye)
 """
 from __future__ import annotations
 
@@ -23,6 +25,7 @@ import shutil
 import subprocess
 import sys
 from array import array
+from collections import Counter
 from operator import mul
 from pathlib import Path
 
@@ -113,6 +116,31 @@ def gray_frames(path, w=160, h=90):
     n = w * h
     data = r.stdout
     return [data[i:i + n] for i in range(0, len(data) - n + 1, n)]
+
+
+def grade_stats(path):
+    """Average brightness (0..255) and the shares of blown-out (>=250) and crushed-black (<=5) pixels, from
+    2 frames per second at 160x90. montazh.py measures the picture before the colour the same way."""
+    cmd = [FFMPEG, "-v", "error", "-i", path, "-an", "-vf", "fps=2,scale=160:90:flags=area,format=gray",
+           "-f", "rawvideo", "-"]
+    hist = [0] * 256
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    try:
+        while True:
+            chunk = proc.stdout.read(1 << 20)  # in chunks: the video is never held in memory
+            if not chunk:
+                break
+            for value, count in Counter(chunk).items():
+                hist[value] += count
+    finally:
+        proc.stdout.close()
+        code = proc.wait()
+    n = sum(hist)
+    if not n or code != 0:  # a failed ffmpeg run may have delivered only part of the frames
+        return None
+    return {"mean": sum(v * c for v, c in enumerate(hist)) / n,
+            "blown": sum(hist[250:]) / n,
+            "crushed": sum(hist[:6]) / n}
 
 
 def seam_check(path, plan):
@@ -225,6 +253,30 @@ def main():
     else:
         add("zoom", True, "not measured: no --face-box was given, so it is unknown whether the zoom cut into the face",
             status="WARN")
+
+    after, before = grade_stats(video), plan.get("picture_before")
+    limits = {"mean": 255, "blown": 1, "crushed": 1}
+    try:  # a number outside its range (also a huge integer) makes the measurement unusable
+        before_ok = isinstance(before, dict) and all(
+            isinstance(before.get(k), (int, float)) and not isinstance(before.get(k), bool)
+            and 0 <= before[k] <= top for k, top in limits.items())
+    except (OverflowError, ValueError, TypeError):
+        before_ok = False
+    if after is None:
+        add("grade", False, "could not read the picture")
+    elif not before_ok:
+        add("grade", True, "not measured: the plan has no usable measurement of the picture before the colour",
+            status="WARN")
+    else:
+        ratio = (after["mean"] + 8.0) / (before["mean"] + 8.0)  # +8 on both sides: unchanged black stays x1.0, black turned gray fails
+        d_crushed = after["crushed"] - before["crushed"]
+        d_blown = after["blown"] - before["blown"]
+        add("grade", 0.7 <= ratio <= 1.4 and d_crushed <= 0.10 and d_blown <= 0.05,
+            f"colour '{plan.get('grade', 'none')}', exposure against the footage before it: brightness "
+            f"{before['mean']:.0f} -> {after['mean']:.0f} of 255 (ratio {ratio:.2f} of brightness+8, ok 0.7-1.4), crushed black "
+            f"{before['crushed'] * 100:.1f}% -> {after['crushed'] * 100:.1f}% (at most +10 points), blown-out "
+            f"{before['blown'] * 100:.1f}% -> {after['blown'] * 100:.1f}% (at most +5 points). "
+            "Brightness only: judge the hue by eye")
 
     w = max(len(r["check"]) for r in rows)
     for r in rows:
